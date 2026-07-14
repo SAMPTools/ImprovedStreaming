@@ -10,6 +10,8 @@
 #include "CAnimManager.h"
 #include <vector>
 #include <algorithm>
+#include <cstdint>
+#include <utility>
 
 using namespace plugin;
 using namespace std;
@@ -18,6 +20,13 @@ using namespace injector;
 const int MAX_MB = 2000;
 const int MULT_MB_TO_BYTE = 1048576;
 constexpr unsigned int MAX_BYTE_LIMIT = (MAX_MB * MULT_MB_TO_BYTE);
+
+// Vanilla SA allocates 26316 CStreamingInfo entries (valid model IDs 0..26315).
+// Indexing past this is an out-of-bounds read AND write (via RequestModel) that
+// corrupts memory in the host process. Used as a safety ceiling on user-supplied
+// range bounds. NOTE: limit adjusters (Open Limit Adjuster / f92la) can raise the
+// real limit; if you run one with model IDs above this, raise this constant to match.
+const int MODEL_ID_LIMIT = 26316;
 
 class LoadWholeMap {
 public:
@@ -39,6 +48,18 @@ public:
 		static bool loadBinaryIPLs = ini.ReadInteger("Settings", "LoadBinaryIPLs", 0) == 1;
 		static bool preLoadAnims = ini.ReadInteger("Settings", "PreLoadAnims", 0) == 1;
 		static int logMode = ini.ReadInteger("Settings", "LogMode", -1);
+
+		// When set, the preload is spread across many frames (one batch per tick)
+		// instead of one multi-second blocking freeze. Default off: opt-in, and the
+		// world pops in progressively rather than being fully present on frame one.
+		static bool amortizeLoad = ini.ReadInteger("Settings", "AmortizeLoad", 0) == 1;
+
+		// Preload work queue, built once then drained (possibly across ticks).
+		// Pair = (modelId, streaming flags). Sorted by on-disk position for
+		// sequential reads; deduped so overlapping ranges don't re-request.
+		static bool preloadBuilt = false;
+		static std::vector<std::pair<int, int>> preloadQueue;
+		static size_t preloadCursor = 0;
 
 		if (logMode >= 0) {
 			lg.open("ImprovedStreaming.log", fstream::out | fstream::trunc);
@@ -139,188 +160,258 @@ public:
 
 			if (loadCheck == 3)
 			{
-				if (!(GetKeyState(0x10) & 0x8000)) // SHIFT
+				// SHIFT held (at first entry, or any tick during an amortized load)
+				// skips / aborts the preload. GetAsyncKeyState reads the real-time key
+				// state without a message pump — GetKeyState would be frozen for the
+				// whole burst since the main thread never pumps messages while loading.
+				if (GetAsyncKeyState(0x10) & 0x8000)
 				{
-
-					streamMemoryForced = ini.ReadInteger("Settings", "StreamMemoryForced", 0);
-					if (streamMemoryForced > 0)
+					preloadQueue.clear();
+					preloadQueue.shrink_to_fit();
+					loadCheck = 4;
+				}
+				else
+				{
+					// ---- BUILD PHASE (runs once) ----
+					// Read config, preload anims, then collect every enabled range's
+					// models into one global queue, dedup, and sort by on-disk position.
+					if (!preloadBuilt)
 					{
-						if (streamMemoryForced > MAX_MB) {
-							streamMemoryForced = MAX_BYTE_LIMIT;
+						streamMemoryForced = ini.ReadInteger("Settings", "StreamMemoryForced", 0);
+						if (streamMemoryForced > 0)
+						{
+							if (streamMemoryForced > MAX_MB) {
+								streamMemoryForced = MAX_BYTE_LIMIT;
+							}
+							else {
+								streamMemoryForced *= MULT_MB_TO_BYTE;
+							}
+							CStreaming::ms_memoryAvailable = streamMemoryForced;
 						}
-						else {
-							streamMemoryForced *= MULT_MB_TO_BYTE;
-						}
-						CStreaming::ms_memoryAvailable = streamMemoryForced;
-					}
 
-					removeUnusedWhenPercent = ini.ReadFloat("Settings", "RemoveUnusedWhenPercent", 0.0f);
-					removeUnusedIntervalMs = ini.ReadInteger("Settings", "RemoveUnusedInterval", 60);
+						removeUnusedWhenPercent = ini.ReadFloat("Settings", "RemoveUnusedWhenPercent", 0.0f);
+						removeUnusedIntervalMs = ini.ReadInteger("Settings", "RemoveUnusedInterval", 60);
 
-					CTimer::Stop();
-
-					if (preLoadAnims) {
-						int animBlocksIdStart = injector::ReadMemory<int>(0x48C36B + 2, true);
-						for (int id = 1; id < CAnimManager::ms_numAnimBlocks; ++id) {
+						if (preLoadAnims) {
+							CTimer::Stop();
+							int animBlocksIdStart = injector::ReadMemory<int>(0x48C36B + 2, true);
+							for (int id = 1; id < CAnimManager::ms_numAnimBlocks; ++id) {
+								if (logMode >= 1)
+								{
+									lg << "Start loading anim " << id << endl;
+								}
+								CStreaming::RequestModel(id + animBlocksIdStart, eStreamingFlags::MISSION_REQUIRED);
+								CAnimManager::AddAnimBlockRef(id);
+							}
+							CStreaming::LoadAllRequestedModels(false);
+							CTimer::Update();
 							if (logMode >= 1)
 							{
-								lg << "Start loading anim " << id << endl;
+								lg << "Finished loading anims." << endl;
 							}
-							CStreaming::RequestModel(id + animBlocksIdStart, eStreamingFlags::MISSION_REQUIRED);
-							CAnimManager::AddAnimBlockRef(id);
 						}
-						CStreaming::LoadAllRequestedModels(false);
-						if (logMode >= 1)
+
+						int i = 0;
+						while (true)
 						{
-							lg << "Finished loading anims." << endl;
-						}
-					}
+							int startId = -1;
+							int endId = -1;
+							int ignoreStart = -1;
+							int ignoreEnd = -1;
+							int biggerThan = -1;
+							int smallerThan = -1;
+							int ignorePedGroup = -1;
+							bool keepLoaded = true;
 
-					int i = 0;
-					while (true)
-					{
-						int loadEach = 0;
-						int startId = -1;
-						int endId = -1;
-						int ignoreStart = -1;
-						int ignoreEnd = -1;
-						int biggerThan = -1;
-						int smallerThan = -1;
-						int ignorePedGroup = -1;
-						bool keepLoaded = true;
+							i++;
 
-						i++;
+							string range = "Range" + to_string(i);
 
-						string range = "Range" + to_string(i);
+							startId = ini.ReadInteger(range, "Start", -1);
+							endId = ini.ReadInteger(range, "End", -1);
+							ignoreStart = ini.ReadInteger(range, "IgnoreStart", -1);
+							ignoreEnd = ini.ReadInteger(range, "IgnoreEnd", -1);
+							biggerThan = ini.ReadInteger(range, "IfBiggerThan", -1);
+							smallerThan = ini.ReadInteger(range, "IfSmallerThan", -1);
+							ignorePedGroup = ini.ReadInteger(range, "IgnorePedGroup", -1) - 1;
+							keepLoaded = ini.ReadInteger(range, "KeepLoaded", 0) == true;
 
-						loadEach = ini.ReadInteger(range, "LoadEach", 0);
-						startId = ini.ReadInteger(range, "Start", -1);
-						endId = ini.ReadInteger(range, "End", -1);
-						ignoreStart = ini.ReadInteger(range, "IgnoreStart", -1);
-						ignoreEnd = ini.ReadInteger(range, "IgnoreEnd", -1);
-						biggerThan = ini.ReadInteger(range, "IfBiggerThan", -1);
-						smallerThan = ini.ReadInteger(range, "IfSmallerThan", -1);
-						ignorePedGroup = ini.ReadInteger(range, "IgnorePedGroup", -1) - 1;
-						keepLoaded = ini.ReadInteger(range, "KeepLoaded", 0) == true;
+							if (startId <= 0 && endId <= 0) break;
 
-						if (startId <= 0 && endId <= 0) break;
+							if (ini.ReadInteger(range, "Enabled", 0) != 1) continue;
 
-						if (ini.ReadInteger(range, "Enabled", 0) != 1) continue;
+							// Clamp against the model-info array bounds. A user-supplied
+							// End=999999 or a defaulted Start=-1 would otherwise read and
+							// (via RequestModel) WRITE out of bounds, corrupting host memory.
+							if (startId < 1) startId = 1;
+							if (endId >= MODEL_ID_LIMIT) endId = MODEL_ID_LIMIT - 1;
 
-						if (logMode >= 0) {
-							lg << "Start loading ID Range: " << i << "\n";
-							lg.flush();
-						}
+							if (logMode >= 0) {
+								lg << "Collecting ID Range: " << i << " (" << startId << ".." << endId << ")\n";
+								lg.flush();
+							}
 
-						if (endId >= startId)
-						{
-							// Collect candidate model IDs first, then sort by their on-disk
-							// position (m_nCdPosn) before requesting/loading. Iterating in
-							// numeric model-ID order does NOT match img archive layout, so
-							// the old ascending-ID loop caused random-order CD reads (seeks).
-							// Sorting by CD position turns this into mostly sequential reads.
-							std::vector<int> modelsToLoad;
+							int flags = keepLoaded ? eStreamingFlags::MISSION_REQUIRED : eStreamingFlags::GAME_REQUIRED;
+
 							for (int model = startId; model <= endId; model++)
 							{
+								if (model < 1 || model >= MODEL_ID_LIMIT) continue; // belt-and-suspenders
 								if ((ignoreStart <= 0 && ignoreEnd <= 0) || (model > ignoreEnd || model < ignoreStart))
 								{
 									if (CStreaming::ms_aInfoForModel[model].m_nCdSize != 0)
 									{
 										if ((biggerThan <= 0 && smallerThan <= 0) || (CStreaming::ms_aInfoForModel[model].m_nCdSize >= biggerThan && CStreaming::ms_aInfoForModel[model].m_nCdSize <= smallerThan))
 										{
-											modelsToLoad.push_back(model);
-										}
-									}
-								}
-							}
-
-							std::sort(modelsToLoad.begin(), modelsToLoad.end(), [](int a, int b)
-							{
-								return CStreaming::ms_aInfoForModel[a].m_nCdPosn < CStreaming::ms_aInfoForModel[b].m_nCdPosn;
-							});
-
-							for (int model : modelsToLoad)
-							{
-								if (GetKeyState(0x10) & 0x8000) break; // SHIFT
-
-								check_limit_to_load:
-								if ((signed int)CStreaming::ms_memoryUsed > (signed int)(CStreaming::ms_memoryAvailable - 50000000))
-								{
-									if (CStreaming::ms_memoryAvailable >= MAX_BYTE_LIMIT)
-									{
-										if (logMode >= 0) {
-											lg << "ERROR: Not enough space\n";
-										}
-										CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to disable some ranges, configure or use other settings.", 8000, false, false);
-									}
-									else {
-										if (streamMemoryForced > 0) {
-											if (IncreaseStreamingMemoryLimit(256)) {
-												streamMemoryForced = CStreaming::ms_memoryAvailable;
-												if (logMode >= 0) {
-													lg << "Streaming memory automatically increased to " << streamMemoryForced << " \n";
+											if (ignorePedGroup > 0 && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
+												if (logMode >= 1)
+												{
+													lg << "Model " << model << " is ignored. Pedgroup: " << ignorePedGroup << "\n";
+													lg.flush();
 												}
-												goto check_limit_to_load;
+												continue;
 											}
-										}
-										else {
-											if (logMode >= 0) {
-												lg << "ERROR: Not enough space. Try to increase the streaming memory.\n";
-											}
-											CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to increase the streaming memory.", 8000, false, false);
+											preloadQueue.push_back(std::make_pair(model, flags));
 										}
 									}
-									if (logMode >= 0) {
-										lg.flush();
-									}
-									break;
-								}
-								else
-								{
-									if (ignorePedGroup > 0 && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
-										if (logMode >= 1)
-										{
-											lg << "Model " << model << " is ignored. Pedgroup: " << ignorePedGroup << "\n";
-											lg.flush();
-										}
-										continue;
-									}
-									if (logMode >= 1)
-									{
-										lg << "Loading " << model << " size " << CStreaming::ms_aInfoForModel[model].m_nCdSize << "\n";
-										lg.flush();
-									}
-									CStreaming::RequestModel(model, keepLoaded ? eStreamingFlags::MISSION_REQUIRED : eStreamingFlags::GAME_REQUIRED);
-									if (CStreaming::ms_numModelsRequested >= loadEach) CStreaming::LoadAllRequestedModels(false);
 								}
 							}
-							CStreaming::LoadAllRequestedModels(false);
 						}
+
+						// Dedup by model ID so overlapping ranges don't queue the same
+						// model twice (RequestModel would no-op the dupes, but this keeps
+						// the queue tight). Keep the first flag seen per ID.
+						std::sort(preloadQueue.begin(), preloadQueue.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b)
+						{
+							return a.first < b.first;
+						});
+						preloadQueue.erase(std::unique(preloadQueue.begin(), preloadQueue.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b)
+						{
+							return a.first == b.first;
+						}), preloadQueue.end());
+
+						// Sort by on-disk location: first by which .img archive
+						// (m_nImgId), then by offset within it (m_nCdPosn). This turns
+						// seek-heavy random reads into one forward sweep per archive.
+						std::sort(preloadQueue.begin(), preloadQueue.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b)
+						{
+							const auto& ia = CStreaming::ms_aInfoForModel[a.first];
+							const auto& ib = CStreaming::ms_aInfoForModel[b.first];
+							if (ia.m_nImgId != ib.m_nImgId) return ia.m_nImgId < ib.m_nImgId;
+							return ia.m_nCdPosn < ib.m_nCdPosn;
+						});
+
+						preloadCursor = 0;
+						preloadBuilt = true;
+
 						if (logMode >= 0) {
-							lg << "Finished loading ID Range: " << i << "\n";
+							lg << "Preload queue built: " << (int)preloadQueue.size() << " models. AmortizeLoad=" << (amortizeLoad ? 1 : 0) << "\n";
 							lg.flush();
 						}
 					}
 
-					// last margin check
-					if ((signed int)CStreaming::ms_memoryUsed > (signed int)(CStreaming::ms_memoryAvailable - 50000000))
+					// ---- DRAIN PHASE ----
+					// Batch size doubles as the per-frame budget in amortized mode.
+					// Clamped so a misconfigured/absent LoadEach (default 0) can't flush
+					// once per model (worst-case seek-per-model) or overshoot the margin.
+					int loadBatch = ini.ReadInteger("Settings", "LoadEach", 32);
+					if (loadBatch < 8)   loadBatch = 32;
+					if (loadBatch > 128) loadBatch = 128;
+
+					// CTimer::Stop()/Update() hides the blocking read time from the game
+					// clock so the physics timestep doesn't spike after the stall. Done
+					// per slice so amortized mode reports a normal dt every frame.
+					CTimer::Stop();
+
+					int requestedThisTick = 0;
+					bool outOfSpace = false;
+					while (preloadCursor < preloadQueue.size())
 					{
-						if (IncreaseStreamingMemoryLimit(128)) {
-							streamMemoryForced = CStreaming::ms_memoryAvailable;
-							if (logMode >= 0) {
-								lg << "Streaming memory automatically increased to " << streamMemoryForced << " after loading (margin).\n";
+						if (GetAsyncKeyState(0x10) & 0x8000) { // SHIFT aborts mid-load
+							preloadCursor = preloadQueue.size();
+							break;
+						}
+
+						int model = preloadQueue[preloadCursor].first;
+						int flags = preloadQueue[preloadCursor].second;
+
+						// Memory-margin check in 64-bit to avoid the unsigned underflow
+						// that a tiny StreamMemoryForced pool would cause in the old
+						// (ms_memoryAvailable - 50000000) unsigned subtraction.
+						if ((int64_t)CStreaming::ms_memoryUsed > (int64_t)CStreaming::ms_memoryAvailable - 50000000)
+						{
+							if (CStreaming::ms_memoryAvailable >= MAX_BYTE_LIMIT)
+							{
+								if (logMode >= 0) {
+									lg << "ERROR: Not enough space\n";
+									lg.flush();
+								}
+								CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to disable some ranges, configure or use other settings.", 8000, false, false);
+								outOfSpace = true;
+								break;
+							}
+							else if (streamMemoryForced > 0 && IncreaseStreamingMemoryLimit(256)) {
+								streamMemoryForced = CStreaming::ms_memoryAvailable;
+								if (logMode >= 0) {
+									lg << "Streaming memory automatically increased to " << streamMemoryForced << " \n";
+									lg.flush();
+								}
+								continue; // re-check margin with the larger pool, same model
+							}
+							else {
+								if (logMode >= 0) {
+									lg << "ERROR: Not enough space. Try to increase the streaming memory.\n";
+									lg.flush();
+								}
+								CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to increase the streaming memory.", 8000, false, false);
+								outOfSpace = true;
+								break;
 							}
 						}
-					}
 
-					if (logMode >= 0) {
-						lg.flush();
+						if (logMode >= 1)
+						{
+							lg << "Loading " << model << " size " << CStreaming::ms_aInfoForModel[model].m_nCdSize << "\n";
+							lg.flush();
+						}
+						CStreaming::RequestModel(model, flags);
+						preloadCursor++;
+						requestedThisTick++;
+
+						if (CStreaming::ms_numModelsRequested >= loadBatch) {
+							CStreaming::LoadAllRequestedModels(false);
+							// In amortized mode, yield the frame after a full batch so the
+							// game renders and stays responsive instead of freezing.
+							if (amortizeLoad && requestedThisTick >= loadBatch) break;
+						}
 					}
+					CStreaming::LoadAllRequestedModels(false);
 					CTimer::Update();
-					gameStartedAfterLoad = CTimer::m_snTimeInMilliseconds;
-				}
 
-				loadCheck = 4;
+					bool done = outOfSpace || preloadCursor >= preloadQueue.size();
+					if (done)
+					{
+						// last margin check
+						if ((int64_t)CStreaming::ms_memoryUsed > (int64_t)CStreaming::ms_memoryAvailable - 50000000)
+						{
+							if (IncreaseStreamingMemoryLimit(128)) {
+								streamMemoryForced = CStreaming::ms_memoryAvailable;
+								if (logMode >= 0) {
+									lg << "Streaming memory automatically increased to " << streamMemoryForced << " after loading (margin).\n";
+								}
+							}
+						}
+
+						if (logMode >= 0) {
+							lg << "Preload finished.\n";
+							lg.flush();
+						}
+						gameStartedAfterLoad = CTimer::m_snTimeInMilliseconds;
+						preloadQueue.clear();
+						preloadQueue.shrink_to_fit();
+						loadCheck = 4;
+					}
+					// else: amortized load still draining — stay in loadCheck==3, resume next tick
+				}
 			}
 
 			if (loadCheck == 4) {
@@ -335,10 +426,23 @@ public:
 						}
 						if ((CTimer::m_snTimeInMilliseconds - lastTimeRemoveUnused) > removeUnusedIntervalMsTweaked) {
 							//CStreaming::RemoveAllUnusedModels();
-							CStreaming::RemoveLeastUsedModel(0);
+							// Free a small bounded batch instead of a single model, so the
+							// reaper can keep memory below the ceiling while the player moves
+							// fast (high model inflow). Once the pool saturates the game's own
+							// MakeSpaceFor kicks in and reintroduces the evict+reload stutter
+							// this mod is meant to prevent. Batch stays small so a mistaken
+							// eviction is cheap; a bulk purge (RemoveAllUnusedModels) would be
+							// a guaranteed frame hitch. Only advance the timer when something
+							// was actually freed, so a no-op doesn't burn the interval.
+							int removeBudget = (memUsedPercent > 95.0f) ? 4 : 2;
+							bool removedAny = false;
+							for (int r = 0; r < removeBudget; ++r) {
+								if (CStreaming::RemoveLeastUsedModel(0)) removedAny = true;
+								else break;
+							}
 							//CStreaming::MakeSpaceFor(10000000);
 							//CMessages::AddMessageJumpQ((char*)"Clear", 500, false, false);
-							lastTimeRemoveUnused = CTimer::m_snTimeInMilliseconds;
+							if (removedAny) lastTimeRemoveUnused = CTimer::m_snTimeInMilliseconds;
 						}
 					}
 				}
@@ -350,7 +454,9 @@ public:
 	static bool IncreaseStreamingMemoryLimit(unsigned int mb) {
 		unsigned int increaseBytes = mb *= MULT_MB_TO_BYTE;
 		unsigned int newLimit = CStreaming::ms_memoryAvailable + increaseBytes;
-		if (newLimit <= 0) return false;
+		// Detect unsigned additive wrap (newLimit < base means it overflowed).
+		// The old `newLimit <= 0` check was dead on an unsigned type.
+		if (newLimit < CStreaming::ms_memoryAvailable) return false;
 		if (newLimit >= MAX_BYTE_LIMIT) newLimit = MAX_BYTE_LIMIT;
 		CStreaming::ms_memoryAvailable = newLimit;
 		return true;
