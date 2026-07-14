@@ -2,6 +2,54 @@
 https://www.mixmods.com.br/2022/04/improved-streaming/  
 Formerly called Load Whole Map
 
+## Building (PC / GTA:SA)
+
+The mod is an ASI plugin built with Visual Studio for **32-bit** GTA:SA
+(`gta_sa.exe` 1.0 US — the build SA-MP attaches to).
+
+### Prerequisites
+
+- **Visual Studio 2019 or newer** with the *Desktop development with C++*
+  workload and a Windows 10 SDK. The project uses platform toolset **v142**.
+- **plugin-sdk** ([DK22Pac/plugin-sdk](https://github.com/DK22Pac/plugin-sdk)) —
+  clone and build it (its build produces `plugin.lib` under `output\lib`),
+  then set an environment variable **`PLUGIN_SDK_DIR`** pointing at its root.
+  The project pulls all its includes and libs from `$(PLUGIN_SDK_DIR)`.
+- **injector** ([thelink2012/injector](https://github.com/thelink2012/injector)) —
+  **not included in this repo** but required (the source does
+  `#include "..\injector\assembly.hpp"`). Place it at **`PC/injector/`** so
+  that relative path resolves (i.e. `PC/injector/assembly.hpp` exists).
+
+### Build
+
+1. Open `LoadWholeMap.sln` in Visual Studio.
+2. Select configuration **`GTASA Release`**, platform **`Win32`** (must be
+   x86 — `gta_sa.exe` is 32-bit; an x64 build will not load).
+3. The output path (`OutDir`) is hard-coded to the original author's disk
+   (`G:\GTA SA The Modded Edition\modloader\...`). Either change it in the
+   project's *General → Output Directory* to your own SA `modloader\` folder,
+   or just grab the built `.asi` from the configured output folder.
+4. Build. The result is **`ImprovedStreaming.SA.asi`**.
+
+### Install
+
+- Put `ImprovedStreaming.SA.asi` in `modloader\` (if you use modloader) or in
+  the GTA:SA root folder together with an ASI loader (e.g. Ultimate ASI
+  Loader).
+- Put `ImprovedStreaming.ini` (and any preset) next to it. Set `LogMode=0` (or
+  higher) to get the diagnostic log — see below.
+
+### Recommended companions
+
+- **[SilentPatch](https://github.com/CookiePLMonster/SilentPatch)** — removes
+  `FILE_FLAG_NO_BUFFERING` from IMG reads (faster streaming via the OS cache)
+  and fixes a streaming deadlock. Recommended alongside this mod.
+- **Open Limit Adjuster / a 4GB (LARGE_ADDRESS_AWARE) patch** — required if
+  you raise the streaming memory limit; without it the process is capped at
+  ~2 GB of address space. See `docs/streaming-memory-safety.md`.
+- If you run **Project2DFX**, disable its `PreloadLODs` — it overlaps with
+  this mod's (removed) LOD preload and the two collide.
+
 ## LogMode
 
 `LogMode` in the `[Settings]` section of `ImprovedStreaming.ini` controls
