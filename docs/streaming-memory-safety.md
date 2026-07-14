@@ -60,14 +60,24 @@ directly from the source thread (SA-MP forum tid=595677):
 
 Two hard consequences:
 
-1. **SA-MP deliberately caps itself at 1 GB** because the process is 32-bit.
-   Going above ~1 GB in SA-MP is documented to *break* streaming: past ~1 GB
-   used, textures stop loading or load extremely slowly, and players work
-   around it by restarting/reconnecting every ~10 minutes (SA-MP forum
-   tid=595677, users Endamete/enbman; the thread's own fix is the
-   LARGE_ADDRESS_AWARE patch). So in SA-MP a 2000 MB pool is not merely
-   wasteful — it is **actively harmful**. The safe cap under SA-MP is
-   **~1024 MB**, matching what SA-MP itself picks on a healthy machine.
+1. **SA-MP's 1 GB is a *no-LAA* cap, not a hard ceiling.** SA-MP picks its
+   tier value assuming a 2 GB address space and knows nothing about LAA, so it
+   never exceeds 1 GB even on a 4 GB-RAM machine. The documented ~1 GB failure
+   (past ~1 GB used, textures stop loading; players restart every ~10 min —
+   SA-MP forum tid=595677, users Endamete/enbman) is really the 2 GB
+   address-space wall being hit. **The thread's own fix for it is the
+   LARGE_ADDRESS_AWARE patch** — i.e. LAA lifts the wall, and with LAA you
+   *can* safely raise streaming above 1 GB. So:
+   - **No LAA:** keep ~1024 MB (SA-MP's value is correct; going higher hits
+     the wall and is actively harmful).
+   - **With LAA:** the SA-MP 1 GB auto-pick can be safely overridden upward to
+     the address-space-safe value (~2000 MB; Junior's stated ceiling is ~3 GB,
+     never 4). Raising it is the documented cure for the texture-stall.
+
+   Caveat (the GC-trigger point below): raising the limit only helps if you
+   are actually hitting the ~1 GB wall (heavy retextures). It does not improve
+   base fidelity — the limit is a garbage-collection trigger, and RoSA needs
+   only ~256–512 MB. Don't raise it speculatively.
 
    *Sourcing:* the tier table and the ~1 GB failure are community-sourced
    (SA-MP forum, cross-checked against the primary thread) — not official
@@ -79,9 +89,12 @@ Two hard consequences:
    SA-MP's safe 1 GB and trigger the failure above. The mod must read and log
    SA-MP's value at `0x8A5A80` first, and must not silently exceed it.
 
-Therefore, for a SA-MP build the safe ceiling is **1024 MB**, not 2000. The
-2000 MB figure is a single-player / heavy-HD-mod ceiling; SA-MP is stricter.
-The auto-clamp (below) uses `min(SA-MP-safe, detected-address-space-safe)`.
+Therefore the SA-MP safe ceiling is **address-space-dependent**: ~1024 MB
+without LAA (do not exceed SA-MP's own value — the wall is real), and up to
+the address-space-safe ~2000 MB with LAA (overriding SA-MP's LAA-unaware
+1 GB auto-pick is safe there). The auto-clamp (below) is driven by the
+detected address space, with SA-MP's 1 GB as the floor-of-safety only on a
+non-LAA process.
 
 Today the mod exposes `StreamMemoryForced` (a raw MB value, capped at
 `MAX_MB = 2000`) and re-asserts it every tick. The upstream release also has a
@@ -127,11 +140,13 @@ existing default** and only reduced below it on a constrained system:
 | ~2 GB (no LAA)   | ~1200 MB           |
 | ~4 GB (LAA)      | 2000 MB (single-player default) |
 
-**Under SA-MP this is further capped at ~1024 MB** regardless of the address
-space, per the SA-MP section above — a larger pool breaks texture streaming
-in multiplayer. The effective cap is `min(1024 if SA-MP, address-space-safe,
-2000)`. Detect SA-MP by reading the tier value SA-MP writes to `0x8A5A80`
-during its init, or by the presence of `samp.dll`.
+**Under SA-MP without LAA, cap at ~1024 MB** — a larger pool hits the 2 GB
+wall and breaks texture streaming. **Under SA-MP with LAA, the ~4 GB row
+applies** (up to ~2000 MB) — LAA is exactly what fixes the multiplayer
+texture-stall, so SA-MP's LAA-unaware 1 GB auto-pick may be safely exceeded.
+So the effective cap is just the address-space-safe value; SA-MP only forces
+the 1024 floor when LAA is absent. Detect SA-MP by the presence of `samp.dll`
+and read the value it writes to `0x8A5A80` during init before overriding it.
 
 The 4 GB row keeps the current default — it does **not** raise the pool.
 Detecting LAA doesn't mean "use more"; it means a 2000 MB pool is safe there,
