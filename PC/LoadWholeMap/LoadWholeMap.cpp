@@ -197,6 +197,36 @@ public:
 						slowestBatchUs = 0;
 						diskBatchCount = 0;
 
+						// ---- Diagnostics: address-space + SA-MP detection (LOG ONLY) ----
+						// Step 1 of docs/streaming-memory-safety.md. This reads and logs the
+						// real values on THIS client (0.3DL) so the numbers can be verified
+						// before any auto-clamp acts on them. It does NOT change any limit yet.
+						if (logMode >= 0) {
+							// Usable address space: ~0x7FFExxxx (≈2 GB) without LAA,
+							// ~0xFFFExxxx (≈4 GB) with LAA on 64-bit Windows.
+							SYSTEM_INFO si; GetSystemInfo(&si);
+							uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
+							bool laaLike = maxAddr >= 0xC0000000; // ≥3 GB ⇒ treat as LAA/4 GB tier
+
+							// What SA-MP (or the game) has set the streaming limit to, BEFORE
+							// this mod overwrites it below. On first entry streamMemoryForced
+							// is still 0, so nothing has clobbered ms_memoryAvailable yet.
+							bool sampPresent = GetModuleHandleA("samp.dll") != nullptr;
+							unsigned int currentMb = CStreaming::ms_memoryAvailable / MULT_MB_TO_BYTE;
+
+							// Recommended safe cap per the concept doc — LOGGED, not applied.
+							int recommendedMb = laaLike ? 2000 : 1200;
+							if (sampPresent && !laaLike && recommendedMb > 1024) recommendedMb = 1024;
+
+							lg << "[mem-detect] max app address = 0x" << std::hex << (unsigned int)maxAddr << std::dec
+							   << " => " << (laaLike ? "~4 GB (LAA present)" : "~2 GB (no LAA)") << "\n";
+							lg << "[mem-detect] samp.dll " << (sampPresent ? "present" : "absent")
+							   << ", current streaming limit set to " << currentMb << " MB (before this mod)\n";
+							lg << "[mem-detect] recommended safe cap = " << recommendedMb
+							   << " MB (NOT yet enforced; StreamMemoryForced still wins this build)\n";
+							lg.flush();
+						}
+
 						streamMemoryForced = ini.ReadInteger("Settings", "StreamMemoryForced", 0);
 						if (streamMemoryForced > 0)
 						{
