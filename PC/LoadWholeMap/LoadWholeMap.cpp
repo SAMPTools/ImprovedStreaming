@@ -9,6 +9,7 @@
 #include "CPopCycle.h"
 #include "CAnimManager.h"
 #include <vector>
+#include <algorithm>
 
 using namespace plugin;
 using namespace std;
@@ -257,67 +258,84 @@ public:
 
 						if (endId >= startId)
 						{
+							// Collect candidate model IDs first, then sort by their on-disk
+							// position (m_nCdPosn) before requesting/loading. Iterating in
+							// numeric model-ID order does NOT match img archive layout, so
+							// the old ascending-ID loop caused random-order CD reads (seeks).
+							// Sorting by CD position turns this into mostly sequential reads.
+							std::vector<int> modelsToLoad;
 							for (int model = startId; model <= endId; model++)
 							{
-								if (GetKeyState(0x10) & 0x8000) break; // SHIFT
 								if ((ignoreStart <= 0 && ignoreEnd <= 0) || (model > ignoreEnd || model < ignoreStart))
 								{
 									if (CStreaming::ms_aInfoForModel[model].m_nCdSize != 0)
 									{
 										if ((biggerThan <= 0 && smallerThan <= 0) || (CStreaming::ms_aInfoForModel[model].m_nCdSize >= biggerThan && CStreaming::ms_aInfoForModel[model].m_nCdSize <= smallerThan))
 										{
-											check_limit_to_load:
-											if ((signed int)CStreaming::ms_memoryUsed > (signed int)(CStreaming::ms_memoryAvailable - 50000000))
-											{
-												if (CStreaming::ms_memoryAvailable >= MAX_BYTE_LIMIT)
-												{
-													if (logMode >= 0) {
-														lg << "ERROR: Not enough space\n";
-													}
-													CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to disable some ranges, configure or use other settings.", 8000, false, false);
-												}
-												else {
-													if (streamMemoryForced > 0) {
-														if (IncreaseStreamingMemoryLimit(256)) {
-															streamMemoryForced = CStreaming::ms_memoryAvailable;
-															if (logMode >= 0) {
-																lg << "Streaming memory automatically increased to " << streamMemoryForced << " \n";
-															}
-															goto check_limit_to_load;
-														}
-													}
-													else {
-														if (logMode >= 0) {
-															lg << "ERROR: Not enough space. Try to increase the streaming memory.\n";
-														}
-														CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to increase the streaming memory.", 8000, false, false);
-													}
-												}
-												if (logMode >= 0) {
-													lg.flush();
-												}
-												break;
-											}
-											else
-											{
-												if (ignorePedGroup > 0 && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
-													if (logMode >= 1)
-													{
-														lg << "Model " << model << " is ignored. Pedgroup: " << ignorePedGroup << "\n";
-														lg.flush();
-													}
-													continue;
-												}
-												if (logMode >= 1)
-												{
-													lg << "Loading " << model << " size " << CStreaming::ms_aInfoForModel[model].m_nCdSize << "\n";
-													lg.flush();
-												}
-												CStreaming::RequestModel(model, keepLoaded ? eStreamingFlags::MISSION_REQUIRED : eStreamingFlags::GAME_REQUIRED);
-												if (CStreaming::ms_numModelsRequested >= loadEach) CStreaming::LoadAllRequestedModels(false);
-											}
+											modelsToLoad.push_back(model);
 										}
 									}
+								}
+							}
+
+							std::sort(modelsToLoad.begin(), modelsToLoad.end(), [](int a, int b)
+							{
+								return CStreaming::ms_aInfoForModel[a].m_nCdPosn < CStreaming::ms_aInfoForModel[b].m_nCdPosn;
+							});
+
+							for (int model : modelsToLoad)
+							{
+								if (GetKeyState(0x10) & 0x8000) break; // SHIFT
+
+								check_limit_to_load:
+								if ((signed int)CStreaming::ms_memoryUsed > (signed int)(CStreaming::ms_memoryAvailable - 50000000))
+								{
+									if (CStreaming::ms_memoryAvailable >= MAX_BYTE_LIMIT)
+									{
+										if (logMode >= 0) {
+											lg << "ERROR: Not enough space\n";
+										}
+										CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to disable some ranges, configure or use other settings.", 8000, false, false);
+									}
+									else {
+										if (streamMemoryForced > 0) {
+											if (IncreaseStreamingMemoryLimit(256)) {
+												streamMemoryForced = CStreaming::ms_memoryAvailable;
+												if (logMode >= 0) {
+													lg << "Streaming memory automatically increased to " << streamMemoryForced << " \n";
+												}
+												goto check_limit_to_load;
+											}
+										}
+										else {
+											if (logMode >= 0) {
+												lg << "ERROR: Not enough space. Try to increase the streaming memory.\n";
+											}
+											CMessages::AddMessageJumpQ((char*)"~r~ERROR Load Whole Map: Not enough space. Try to increase the streaming memory.", 8000, false, false);
+										}
+									}
+									if (logMode >= 0) {
+										lg.flush();
+									}
+									break;
+								}
+								else
+								{
+									if (ignorePedGroup > 0 && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
+										if (logMode >= 1)
+										{
+											lg << "Model " << model << " is ignored. Pedgroup: " << ignorePedGroup << "\n";
+											lg.flush();
+										}
+										continue;
+									}
+									if (logMode >= 1)
+									{
+										lg << "Loading " << model << " size " << CStreaming::ms_aInfoForModel[model].m_nCdSize << "\n";
+										lg.flush();
+									}
+									CStreaming::RequestModel(model, keepLoaded ? eStreamingFlags::MISSION_REQUIRED : eStreamingFlags::GAME_REQUIRED);
+									if (CStreaming::ms_numModelsRequested >= loadEach) CStreaming::LoadAllRequestedModels(false);
 								}
 							}
 							CStreaming::LoadAllRequestedModels(false);
