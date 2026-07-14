@@ -258,11 +258,22 @@ public:
 								if (model < 1 || model >= MODEL_ID_LIMIT) continue; // belt-and-suspenders
 								if ((ignoreStart <= 0 && ignoreEnd <= 0) || (model > ignoreEnd || model < ignoreStart))
 								{
-									if (CStreaming::ms_aInfoForModel[model].m_nCdSize != 0)
+									unsigned int cdSize = CStreaming::ms_aInfoForModel[model].m_nCdSize;
+									if (cdSize != 0)
 									{
-										if ((biggerThan <= 0 && smallerThan <= 0) || (CStreaming::ms_aInfoForModel[model].m_nCdSize >= biggerThan && CStreaming::ms_aInfoForModel[model].m_nCdSize <= smallerThan))
+										// Treat an unset (-1) bound as "no bound". m_nCdSize is
+										// unsigned, so the old `m_nCdSize >= biggerThan` with
+										// biggerThan==-1 promoted -1 to UINT_MAX and silently
+										// dropped everything when only IfSmallerThan was set.
+										if ((biggerThan <= 0 || cdSize >= (unsigned int)biggerThan) &&
+										    (smallerThan <= 0 || cdSize <= (unsigned int)smallerThan))
 										{
-											if (ignorePedGroup > 0 && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
+											// Bound the ped-group index before calling into game
+											// code. CPopCycle::IsPedInGroup indexes a fixed table
+											// with no validation; an out-of-range IgnorePedGroup
+											// (e.g. =1000) reads past it and AVs the host process
+											// (the Android port disabled this call for that reason).
+											if (ignorePedGroup > 0 && ignorePedGroup < POPCYCLE_TOTAL_NUM_PEDGROUPS && CPopCycle::IsPedInGroup(model, ignorePedGroup)) {
 												if (logMode >= 1)
 												{
 													lg << "Model " << model << " is ignored. Pedgroup: " << ignorePedGroup << "\n";
@@ -314,7 +325,7 @@ public:
 					// Clamped so a misconfigured/absent LoadEach (default 0) can't flush
 					// once per model (worst-case seek-per-model) or overshoot the margin.
 					int loadBatch = ini.ReadInteger("Settings", "LoadEach", 32);
-					if (loadBatch < 8)   loadBatch = 32;
+					if (loadBatch < 8)   loadBatch = 8; // clamp to floor, don't snap to 32 (keeps small user batches)
 					if (loadBatch > 128) loadBatch = 128;
 
 					// CTimer::Stop()/Update() hides the blocking read time from the game
@@ -370,8 +381,11 @@ public:
 
 						if (logMode >= 1)
 						{
+							// No per-model flush: on an HDD it forces a seek to the log file
+							// and back between every model request, serialized on the game
+							// thread and interleaved with the .img sweep. Let it buffer; the
+							// phase-boundary flushes below cover it.
 							lg << "Loading " << model << " size " << CStreaming::ms_aInfoForModel[model].m_nCdSize << "\n";
-							lg.flush();
 						}
 						CStreaming::RequestModel(model, flags);
 						preloadCursor++;
