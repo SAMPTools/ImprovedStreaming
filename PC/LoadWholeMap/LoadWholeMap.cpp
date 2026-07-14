@@ -1,5 +1,5 @@
 #include "plugin.h"
-#include "..\injector\assembly.hpp"
+#include "injector\assembly.hpp"
 #include "CStreaming.h"
 #include "IniReader/IniReader.h"
 #include "CIplStore.h"
