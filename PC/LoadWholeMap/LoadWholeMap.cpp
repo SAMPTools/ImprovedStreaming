@@ -37,10 +37,8 @@ public:
 
 		static CIniReader ini("ImprovedStreaming.ini");
 		static bool loadBinaryIPLs = ini.ReadInteger("Settings", "LoadBinaryIPLs", 0) == 1;
-		static bool preLoadLODs = ini.ReadInteger("Settings", "PreLoadLODs", 0) == 1;
 		static bool preLoadAnims = ini.ReadInteger("Settings", "PreLoadAnims", 0) == 1;
 		static int logMode = ini.ReadInteger("Settings", "LogMode", -1);
-		static std::vector<void*> lods; // CEntity*
 
 		if (logMode >= 0) {
 			lg.open("ImprovedStreaming.log", fstream::out | fstream::trunc);
@@ -104,20 +102,6 @@ public:
 				}; injector::MakeInline<LoadAllBinaryIPLs>(0x5D19A4);
 			}*/
 
-			// by ThirteenAG
-			if (preLoadLODs) {
-				// not hooked yet (p2dfx may hook it)
-				// ...but this mod enabled other stuff that is better than how p2dfx works
-				//if (injector::ReadMemory<uint32_t>(0x5B5295, true) == 0x2248BF0F) {
-					injector::MakeInline<0x5B5295, 0x5B5295 + 8>([](injector::reg_pack& regs)
-					{
-						regs.ecx = *(uint16_t*)(regs.eax + 0x22);  // mah let's make it unsigned
-						regs.edx = *(uint16_t*)(regs.esi + 0x22);
-						lods.push_back((void*)regs.eax);
-					});
-				//}
-			}
-
 		};
 
 		// ---------------------------------------------------
@@ -174,34 +158,6 @@ public:
 					removeUnusedIntervalMs = ini.ReadInteger("Settings", "RemoveUnusedInterval", 60);
 
 					CTimer::Stop();
-
-					if (preLoadLODs) {
-						// Based on ThirteenAG's project2dfx
-						if (lods.size() > 0) {
-							// Put the id of the lods in another container
-							std::vector<uint16_t> lods_id(lods.size());
-							std::transform(lods.begin(), lods.end(), lods_id.begin(), [](void* entity)
-							{
-								return *(uint16_t*)((uintptr_t)(entity)+0x22);
-							});
-
-							// Load all lod models
-							std::for_each(lods_id.begin(), std::unique(lods_id.begin(), lods_id.end()), [](uint16_t id) { CStreaming::RequestModel(id, eStreamingFlags::MISSION_REQUIRED); });
-							CStreaming::LoadAllRequestedModels(false);
-
-							// Instantiate all lod entities RwObject
-							//if (false) {
-								std::for_each(lods.begin(), lods.end(), [](void* entity) {
-									auto rwObject = *(void**)((uintptr_t)(entity)+0x18);
-									if (rwObject == nullptr) {
-										//lg << "Loading LOD " << (int)entity << ".\n";
-										//injector::thiscall<void(void*)>::vtbl<7>(entity);
-										CallMethod<0x533D30>(entity);
-									}
-								});
-							//}
-						}
-					}
 
 					if (preLoadAnims) {
 						int animBlocksIdStart = injector::ReadMemory<int>(0x48C36B + 2, true);
