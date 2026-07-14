@@ -44,6 +44,37 @@ The `MAX_MB = 2000` cap (not 2048) is the author's deliberate headroom for
 exactly reason (b). This design treats that 2000 as the fixed safe default
 and only ever clamps **below** it — never above.
 
+### SA-MP changes the picture (important for this project)
+
+This fork targets SA-MP (Nova Legacy). SA-MP does **not** leave the streaming
+limit at the vanilla value — it sets `ms_memoryAvailable` itself at startup,
+by system-RAM tier (SA-MP forum, moderator Matite):
+
+| System RAM | SA-MP sets streaming to |
+|------------|-------------------------|
+| ≥ 4 GB     | **1024 MB**             |
+| 2–4 GB     | 512 MB                  |
+| 1–2 GB     | 256 MB                  |
+| < 1 GB     | 128 MB                  |
+
+Two hard consequences:
+
+1. **SA-MP deliberately caps itself at 1 GB** because the process is 32-bit.
+   Going above ~1 GB in SA-MP is documented to *break* streaming: past ~1 GB
+   used, textures stop loading or load extremely slowly, and players work
+   around it by reconnecting every 10–15 minutes (SA-MP forum tid=595677).
+   So in SA-MP a 2000 MB pool is not merely wasteful — it is **actively
+   harmful**. The safe cap under SA-MP is **~1024 MB**, matching what SA-MP
+   itself picks on a healthy machine.
+2. **`StreamMemoryForced` is re-asserted every tick**, so it overrides SA-MP's
+   tier value. That is the exact mechanism that would push the pool past
+   SA-MP's safe 1 GB and trigger the failure above. The mod must read and log
+   SA-MP's value at `0x8A5A80` first, and must not silently exceed it.
+
+Therefore, for a SA-MP build the safe ceiling is **1024 MB**, not 2000. The
+2000 MB figure is a single-player / heavy-HD-mod ceiling; SA-MP is stricter.
+The auto-clamp (below) uses `min(SA-MP-safe, detected-address-space-safe)`.
+
 Today the mod exposes `StreamMemoryForced` (a raw MB value, capped at
 `MAX_MB = 2000`) and re-asserts it every tick. The upstream release also has a
 `MaxRAM` option (unload when process RAM exceeds a value); **that is not
@@ -81,12 +112,18 @@ This is preferred over parsing the PE header's
 ceiling (LAA **and** the OS together), which is what actually matters.
 
 Derive a safe streaming ceiling from it. The ceiling is **capped at the
-existing 2000 MB default** and only reduced below it on a constrained system:
+existing default** and only reduced below it on a constrained system:
 
 | Detected ceiling | Safe streaming cap |
 |------------------|--------------------|
 | ~2 GB (no LAA)   | ~1200 MB           |
-| ~4 GB (LAA)      | 2000 MB (unchanged default) |
+| ~4 GB (LAA)      | 2000 MB (single-player default) |
+
+**Under SA-MP this is further capped at ~1024 MB** regardless of the address
+space, per the SA-MP section above — a larger pool breaks texture streaming
+in multiplayer. The effective cap is `min(1024 if SA-MP, address-space-safe,
+2000)`. Detect SA-MP by reading the tier value SA-MP writes to `0x8A5A80`
+during its init, or by the presence of `samp.dll`.
 
 The 4 GB row keeps the current default — it does **not** raise the pool.
 Detecting LAA doesn't mean "use more"; it means a 2000 MB pool is safe there,

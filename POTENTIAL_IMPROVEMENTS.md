@@ -124,3 +124,44 @@ These came up in review but are minor and not scheduled:
   measurable.
 - **`RemoveUnusedInterval` not lower-bounded** — `0` or negative makes the
   reaper run every frame; a churn/perf concern, not a crash.
+
+---
+
+## From web research (GTA SA / SA-MP streaming)
+
+Findings from researching community streaming knowledge. Sources: MTA Wiki
+(Resource Streaming), GTAMods Wiki, SA-MP forum, SilentPatch notes,
+DK22Pac/plugin-sdk, mixmods.
+
+- **Preload with a keep-in-memory flag, or it's wasted.** `RequestModel(id,
+  GAME_REQUIRED)` loads a model the engine's own reaper may evict the next
+  frame; only `MISSION_REQUIRED` (our `KeepLoaded=1`) pins it. With the
+  default `KeepLoaded=0`, a chunk of the preload can be reaped immediately,
+  and our reaper + the engine's reaper can thrash. **Consider defaulting
+  preloaded ranges to a keep flag**, or at least documenting that `KeepLoaded`
+  should usually be `1`. Verify the exact R5 flag values on target.
+- **The disk-position sort is lower-value than assumed.** The engine already
+  issues streaming reads in IMG-offset order via `GetNextFileOnCd`
+  (`0x408E20`). Our pre-sort is correct in spirit but the win is ~0 on SSD
+  and marginal on HDD. Keep it (it's cheap), but don't invest further; it is
+  not the throughput lever it looks like.
+- **SilentPatch is the real disk-throughput win — as a companion, not a
+  reimplementation.** It removes `FILE_FLAG_NO_BUFFERING` from IMG reads (lets
+  the OS cache them) and fixes a streaming deadlock. Recommend it as a
+  prerequisite in the README rather than duplicating its behavior.
+- **The `LoadAllRequestedModels(false)` burst is the freeze** — corroborated
+  by community reports of multi-second stalls when the pool flushes a large
+  amount at once. This is what `AmortizeLoad` addresses; the research
+  supports prioritizing that path.
+- **Model-ID bands (reference for targeting preload ranges):** DFF 0–19999,
+  TXD 20000–24999, COL 25000–25255, IPL 25256–25510, DAT 25511–25574,
+  IFP anims 25575–25754, RRR 25755–25819. Preloading all anims (the
+  SAM-P-relevant case) = the 25575–25754 band.
+- **`MakeSpaceFor` (`0x40E120`) / `RemoveLeastUsedModel` (`0x40CFD0`) respect
+  streaming flags.** Our reaper already calls the real `RemoveLeastUsedModel`,
+  so it inherits the engine's "don't evict in-use/flagged" safety — good. Do
+  not replace it with a hand-rolled LRU eviction, which could free an in-use
+  model and AV.
+
+The SA-MP streaming-memory tiering and the ~1 GB SA-MP ceiling are covered in
+detail in [docs/streaming-memory-safety.md](docs/streaming-memory-safety.md).
