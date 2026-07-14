@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
+#include <chrono>
 
 using namespace plugin;
 using namespace std;
@@ -61,9 +62,22 @@ public:
 		static std::vector<std::pair<int, int>> preloadQueue;
 		static size_t preloadCursor = 0;
 
+		// Profiling counters (only meaningful/emitted when LogMode >= 0). steady_clock
+		// is real wall-clock and immune to the CTimer::Stop/Update trick, which freezes
+		// the game clock during loads. Used to answer "how long does the preload take"
+		// and "how long does each blocking disk batch stall the main thread".
+		static std::chrono::steady_clock::time_point preloadStart;   // build begins
+		static int    preloadTotalModels = 0;   // queue size at start of draining
+		static int    drainTicks = 0;           // frames the drain spanned (amortized)
+		static long long blockingLoadUs = 0;    // cumulative us in LoadAllRequestedModels
+		static long long slowestBatchUs = 0;    // worst single blocking batch (us)
+		static int    diskBatchCount = 0;        // how many batches actually hit disk
+
 		if (logMode >= 0) {
 			lg.open("ImprovedStreaming.log", fstream::out | fstream::trunc);
-			lg << "v1.0" << endl;
+			lg << "ImprovedStreaming log" << endl;
+			lg << "LogMode levels: 0 = timing summaries, 1 = + reaper/ignores, 2 = + per-model/per-batch" << endl;
+			lg << "----------------------------------------" << endl;
 		}
 
 		Events::initRwEvent += []
@@ -177,6 +191,12 @@ public:
 					// models into one global queue, dedup, and sort by on-disk position.
 					if (!preloadBuilt)
 					{
+						preloadStart = std::chrono::steady_clock::now();
+						drainTicks = 0;
+						blockingLoadUs = 0;
+						slowestBatchUs = 0;
+						diskBatchCount = 0;
+
 						streamMemoryForced = ini.ReadInteger("Settings", "StreamMemoryForced", 0);
 						if (streamMemoryForced > 0)
 						{
@@ -193,24 +213,30 @@ public:
 						removeUnusedIntervalMs = ini.ReadInteger("Settings", "RemoveUnusedInterval", 60);
 
 						if (preLoadAnims) {
+							auto animStart = std::chrono::steady_clock::now();
 							CTimer::Stop();
 							int animBlocksIdStart = injector::ReadMemory<int>(0x48C36B + 2, true);
+							int animCount = 0;
 							for (int id = 1; id < CAnimManager::ms_numAnimBlocks; ++id) {
-								if (logMode >= 1)
+								if (logMode >= 2)
 								{
 									lg << "Start loading anim " << id << endl;
 								}
 								CStreaming::RequestModel(id + animBlocksIdStart, eStreamingFlags::MISSION_REQUIRED);
 								CAnimManager::AddAnimBlockRef(id);
+								animCount++;
 							}
 							CStreaming::LoadAllRequestedModels(false);
 							CTimer::Update();
-							if (logMode >= 1)
+							if (logMode >= 0)
 							{
-								lg << "Finished loading anims." << endl;
+								auto animMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - animStart).count();
+								lg << "[timing] anims: loaded " << animCount << " blocks (blocking) in " << (int)animMs << " ms\n";
+								lg.flush();
 							}
 						}
 
+						auto collectStart = std::chrono::steady_clock::now();
 						int i = 0;
 						while (true)
 						{
@@ -288,6 +314,10 @@ public:
 							}
 						}
 
+						auto collectMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - collectStart).count();
+						int collectedRaw = (int)preloadQueue.size();
+						auto sortStart = std::chrono::steady_clock::now();
+
 						// Dedup by model ID so overlapping ranges don't queue the same
 						// model twice (RequestModel would no-op the dupes, but this keeps
 						// the queue tight). Keep the first flag seen per ID.
@@ -311,11 +341,19 @@ public:
 							return ia.m_nCdPosn < ib.m_nCdPosn;
 						});
 
+						auto sortMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sortStart).count();
+
 						preloadCursor = 0;
+						preloadTotalModels = (int)preloadQueue.size();
 						preloadBuilt = true;
 
 						if (logMode >= 0) {
-							lg << "Preload queue built: " << (int)preloadQueue.size() << " models. AmortizeLoad=" << (amortizeLoad ? 1 : 0) << "\n";
+							lg << "[timing] build: collect " << (int)collectMs << " ms, dedup+sort " << (int)sortMs << " ms\n";
+							lg << "Preload queue built: " << preloadTotalModels << " models"
+							   << " (" << (collectedRaw - preloadTotalModels) << " dupes removed)"
+							   << ", AmortizeLoad=" << (amortizeLoad ? 1 : 0)
+							   << ", LoadEach=" << ini.ReadInteger("Settings", "LoadEach", 32)
+							   << ", memAvail=" << (CStreaming::ms_memoryAvailable / MULT_MB_TO_BYTE) << " MB\n";
 							lg.flush();
 						}
 					}
@@ -392,14 +430,37 @@ public:
 						requestedThisTick++;
 
 						if (CStreaming::ms_numModelsRequested >= loadBatch) {
+							int queued = CStreaming::ms_numModelsRequested;
+							auto batchStart = std::chrono::steady_clock::now();
 							CStreaming::LoadAllRequestedModels(false);
+							auto batchUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - batchStart).count();
+							blockingLoadUs += batchUs;
+							if (batchUs > slowestBatchUs) slowestBatchUs = batchUs;
+							diskBatchCount++;
+							if (logMode >= 2) {
+								lg << "[batch] " << queued << " models blocked " << (int)(batchUs / 1000) << " ms"
+								   << " (cursor " << (int)preloadCursor << "/" << preloadTotalModels << ")\n";
+								lg.flush();
+							}
 							// In amortized mode, yield the frame after a full batch so the
 							// game renders and stays responsive instead of freezing.
 							if (amortizeLoad && requestedThisTick >= loadBatch) break;
 						}
 					}
-					CStreaming::LoadAllRequestedModels(false);
+					{
+						// Final flush of the partial batch left after the loop exits.
+						int queued = CStreaming::ms_numModelsRequested;
+						auto batchStart = std::chrono::steady_clock::now();
+						CStreaming::LoadAllRequestedModels(false);
+						auto batchUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - batchStart).count();
+						if (queued > 0) {
+							blockingLoadUs += batchUs;
+							if (batchUs > slowestBatchUs) slowestBatchUs = batchUs;
+							diskBatchCount++;
+						}
+					}
 					CTimer::Update();
+					drainTicks++;
 
 					bool done = outOfSpace || preloadCursor >= preloadQueue.size();
 					if (done)
@@ -416,7 +477,20 @@ public:
 						}
 
 						if (logMode >= 0) {
-							lg << "Preload finished.\n";
+							auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - preloadStart).count();
+							int loadedFromDisk = (int)preloadCursor;
+							double sec = totalMs / 1000.0;
+							int modelsPerSec = sec > 0.0 ? (int)(loadedFromDisk / sec) : 0;
+							lg << "========================================\n";
+							lg << "Preload finished" << (outOfSpace ? " (STOPPED: out of space)" : "") << ".\n";
+							lg << "  total wall-clock : " << (int)totalMs << " ms (" << sec << " s)\n";
+							lg << "  models requested : " << loadedFromDisk << " / " << preloadTotalModels << "\n";
+							lg << "  throughput       : " << modelsPerSec << " models/s\n";
+							lg << "  disk batches     : " << diskBatchCount << "\n";
+							lg << "  blocking in load : " << (int)(blockingLoadUs / 1000) << " ms total, worst batch " << (int)(slowestBatchUs / 1000) << " ms\n";
+							lg << "  drain spanned    : " << drainTicks << " frame(s) (AmortizeLoad=" << (amortizeLoad ? 1 : 0) << ")\n";
+							lg << "  memory used/avail: " << (CStreaming::ms_memoryUsed / MULT_MB_TO_BYTE) << " / " << (CStreaming::ms_memoryAvailable / MULT_MB_TO_BYTE) << " MB\n";
+							lg << "========================================\n";
 							lg.flush();
 						}
 						gameStartedAfterLoad = CTimer::m_snTimeInMilliseconds;
@@ -449,14 +523,25 @@ public:
 							// a guaranteed frame hitch. Only advance the timer when something
 							// was actually freed, so a no-op doesn't burn the interval.
 							int removeBudget = (memUsedPercent > 95.0f) ? 4 : 2;
-							bool removedAny = false;
+							int removedCount = 0;
 							for (int r = 0; r < removeBudget; ++r) {
-								if (CStreaming::RemoveLeastUsedModel(0)) removedAny = true;
+								if (CStreaming::RemoveLeastUsedModel(0)) removedCount++;
 								else break;
 							}
 							//CStreaming::MakeSpaceFor(10000000);
 							//CMessages::AddMessageJumpQ((char*)"Clear", 500, false, false);
-							if (removedAny) lastTimeRemoveUnused = CTimer::m_snTimeInMilliseconds;
+							if (removedCount > 0) lastTimeRemoveUnused = CTimer::m_snTimeInMilliseconds;
+
+							if (logMode >= 1) {
+								// Watch for eviction pressure. If this fires constantly at
+								// high mem% while removedCount is often 0 (nothing evictable),
+								// the pool is saturated and MakeSpaceFor thrash is imminent —
+								// a sign to raise StreamMemoryForced or tighten the ranges.
+								lg << "[reaper] mem " << (int)memUsedPercent << "% (" << (CStreaming::ms_memoryUsed / MULT_MB_TO_BYTE)
+								   << "/" << (CStreaming::ms_memoryAvailable / MULT_MB_TO_BYTE) << " MB), evicted " << removedCount
+								   << "/" << removeBudget << (removedCount < removeBudget ? " (nothing more to free)" : "") << "\n";
+								lg.flush();
+							}
 						}
 					}
 				}
