@@ -84,6 +84,18 @@ Two hard consequences:
    SA-MP documentation and not yet confirmed by a runtime read on this
    target. Reading `0x8A5A80` in-game (step below) is the authoritative
    check and should be done before the auto-clamp acts on these numbers.
+
+   **Version caveat — this fork targets 0.3DL, the forum data is 0.3.7.**
+   0.3DL is the renamed 0.3.8 RC, derived from 0.3.7 with server-side custom
+   model downloading added. It *probably* inherits the same RAM-tier
+   streaming allocation, but this is **unconfirmed** — no 0.3DL-specific
+   streaming-memory figures were found. Two implications: (a) do not trust the
+   0.3.7 tier table as fact for 0.3DL — the runtime `0x8A5A80` read is the
+   only version-agnostic ground truth and becomes the primary input, with the
+   table as a rough expectation only; (b) 0.3DL streams *extra* downloaded
+   custom models (DFF/TXD) on top of the base map, so pool pressure is if
+   anything *higher* than vanilla 0.3.7 — another reason the guard (part 3)
+   and reading the real value matter more here, not less.
 2. **`StreamMemoryForced` is re-asserted every tick**, so it overrides SA-MP's
    tier value. That is the exact mechanism that would push the pool past
    SA-MP's safe 1 GB and trigger the failure above. The mod must read and log
