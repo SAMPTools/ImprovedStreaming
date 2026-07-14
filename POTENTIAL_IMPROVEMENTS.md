@@ -46,6 +46,29 @@ if (ignorePedGroup >= 0 && ignorePedGroup < POPCYCLE_TOTAL_NUM_PEDGROUPS
     && CPopCycle::IsPedInGroup(model, ignorePedGroup)) { ... }
 ```
 
+**Research verdict (2026-07): SKIP as framed — at most a trivial one-char
+fix, no migration needed.** Unbiased web research revised the premise:
+
+- The proposal's "every other value is off by one" claim is likely wrong. The
+  `ReadInteger(...) - 1` is a deliberate 1-based→0-based conversion, so values
+  ≥2 already map correctly (`2`→WORKERS_SF, …). The *only* real defect is the
+  `> 0` gate, which drops the single value mapping to index 0 — so
+  `POPCYCLE_PEDGROUP_WORKERS_LA` can never be ignored. A one-char change
+  (`> 0` → `>= 0`, keeping the `-1`) fixes exactly that and changes no
+  currently-working value, so **no config-version bump or migration is
+  needed**. The migration concern only applies to the raw-index remap variant
+  — don't take that route.
+- Ped-group indexing confirmed as described: index 0 is `WORKERS_LA`;
+  ~57–60 groups ending in the `POPCYCLE_TOTAL_NUM_PEDGROUPS` sentinel.
+- Near-dead feature under SA-MP: the server controls peds and ambient GTA
+  population is disabled, so excluding a popcycle ped group from a preload has
+  little practical effect in 0.3DL. Low upside even for the minimal fix.
+- Mandatory piece (the AV guard) is already applied.
+
+Sources: [plugin-sdk CPopCycle.h](https://github.com/DK22Pac/plugin-sdk/blob/master/plugin_sa/game_sa/CPopCycle.h),
+[gta-reversed population system](https://deepwiki.com/mrxenginner/gta-reversed/9.1-population-system),
+[GTAMods Popcycle.dat](https://gtamods.com/wiki/Popcycle.dat).
+
 ---
 
 ## 2. Amortize the animation preload
@@ -78,6 +101,29 @@ the first frame they would otherwise stream in.
 `AddAnimBlockRef` as each anim model is drained (or keep the ref loop but
 drop the eager `LoadAllRequestedModels`/`CTimer` pair).
 
+**Research verdict (2026-07): SKIP now — but easier than this note claims
+when revisited.** Unbiased web research found:
+
+- The stated difficulty is overstated. `CAnimManager::AddAnimBlockRef` is a
+  pure `usRefs++` counter, decoupled from load I/O — it pins a slot against
+  eviction, it does not require the block's data to be resident. So the ref
+  bookkeeping does *not* have to be threaded through the drain loop: keep the
+  eager `AddAnimBlockRef` loop (cheap, no I/O; it just protects the queued
+  slots), fold only the `RequestModel` calls into `preloadQueue`, and drop the
+  eager `LoadAllRequestedModels`. That is a small, low-risk change.
+- Small, bounded payoff: ~180 anim blocks (band 25575–25754) from one archive
+  (~30 MB total) → a sub-second freeze, an order of magnitude smaller than the
+  map-model preload `AmortizeLoad` exists for. Anim.img byte size unverified.
+- Only helps the intersection of two niche, default-off flags
+  (`AmortizeLoad=1` **and** `PreLoadAnims=1`).
+- Premature while the base `AmortizeLoad` drain path is itself unverified
+  in-game. Sequencing: prove the map-model drain first; revisit anims only if
+  a user reports the `PreLoadAnims` startup hitch.
+
+Sources: [jte/GTASA CAnimManager.cpp](https://github.com/jte/GTASA/blob/master/Engine/Animations/CAnimManager.cpp),
+[mtasa-blue CAnimManagerSA.cpp](https://github.com/multitheftauto/mtasa-blue/blob/master/Client/game_sa/CAnimManagerSA.cpp),
+[MTA GTA:SA Resource Streaming](https://wiki.multitheftauto.com/wiki/GTA:SA_Resource_Streaming).
+
 ---
 
 ## 3. True async streaming for amortized mode
@@ -104,6 +150,41 @@ work moves off the main thread → near-zero per-frame hitch during preload.
 **Risk.** High. Changes residency/eviction semantics and the timing model.
 Keep the current blocking-batch path as the default; expose async as an
 opt-in mode and validate memory behavior under fast movement.
+
+**Research verdict (2026-07): SKIP the full proposal — the "error-prone"
+instinct holds and the reward is smaller than stated.** Unbiased web research
+found:
+
+- The benefit is overstated. Model conversion (`ConvertBufferToObject` — RW
+  stream parse, geometry/texture instantiation) runs on the **main thread in
+  both paths**, inside `ProcessLoadingChannel`. Async removes only the
+  disk-*wait* idle, not the CPU conversion cost — which is usually the larger
+  hitch. "Disk work moves off main thread → near-zero hitch" is only half true.
+- The residency concern is real. The bulk is requested `GAME_REQUIRED`, which
+  is evictable by design; draining it over many frames while the player moves
+  gives `MakeSpaceFor` a wide window to reclaim already-loaded models →
+  weakened load-whole-map guarantee.
+- Closing that hole by pinning everything `KEEP_IN_MEMORY`/`MISSION_REQUIRED`
+  makes the reaper (`RemoveLeastUsedModel`) a no-op and removes the memory
+  pressure valve — colliding with the `docs/streaming-memory-safety.md` model.
+  The two safe options contradict each other.
+- The technique is proven only at trivial scale (the CLEO `RequestModel` +
+  wait idiom). Dumping thousands of IDs loses rate control — a full-map
+  preload could take minutes and be starved by gameplay `PRIORITY_REQUEST`s.
+- Low SilentPatch-overlap (it touches only the CdStream read path, not request
+  semantics), but SilentPatch already made reads fast, so the disk-wait async
+  would remove is already small on SSD — reward is thin exactly where it's safe.
+- If anything, prototype a narrow HDD-only opt-in (`RequestModel` + yield to
+  the engine's `Update()` instead of `LoadAllRequestedModels`) measured with
+  `[mem-detect]` logging for `GAME_REQUIRED` eviction under fast movement; drop
+  it if there's no clear win.
+
+Sources: [gta-reversed streaming](https://deepwiki.com/mrxenginner/gta-reversed),
+[MTA GTA:SA Resource Streaming](https://wiki.multitheftauto.com/wiki/GTA:SA_Resource_Streaming),
+[GTAMods Resource Streaming](https://gtamods.com/wiki/Resource_Streaming),
+[plugin-sdk CStreamingInfo.h](https://github.com/DK22Pac/plugin-sdk/blob/master/plugin_sa/game_sa/CStreamingInfo.h),
+[CLEO Redux async](https://re.cleo.li/docs/en/async.html),
+[SilentPatch CHANGELOG-SA](https://github.com/CookiePLMonster/SilentPatch/blob/dev/CHANGELOG-SA.md).
 
 ---
 
