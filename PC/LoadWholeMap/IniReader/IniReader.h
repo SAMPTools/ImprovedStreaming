@@ -183,7 +183,14 @@ public:
     int ReadInteger(std::string_view szSection, std::string_view szKey, int iDefaultValue)
     {
         auto str = data.get(szSection.data(), szKey.data(), std::to_string(iDefaultValue));
-        return std::stoi(str, nullptr, starts_with(str.c_str(), "0x", false) ? 16 : 10);
+        // std::stoi throws on non-numeric / empty / out-of-range values. These come
+        // straight from a user-edited .ini and are read from inside a game hook, so an
+        // uncaught throw would std::terminate the host process. Fall back to the default.
+        try {
+            return std::stoi(str, nullptr, starts_with(str.c_str(), "0x", false) ? 16 : 10);
+        } catch (...) {
+            return iDefaultValue;
+        }
     }
 
     float ReadFloat(std::string_view szSection, std::string_view szKey, float fltDefaultValue)
