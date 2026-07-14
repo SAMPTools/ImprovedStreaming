@@ -48,7 +48,8 @@ and only ever clamps **below** it — never above.
 
 This fork targets SA-MP (Nova Legacy). SA-MP does **not** leave the streaming
 limit at the vanilla value — it sets `ms_memoryAvailable` itself at startup,
-by system-RAM tier (SA-MP forum, moderator Matite):
+by system-RAM tier. Stated by SA-MP Beta Tester "Matite" and confirmed
+directly from the source thread (SA-MP forum tid=595677):
 
 | System RAM | SA-MP sets streaming to |
 |------------|-------------------------|
@@ -62,10 +63,17 @@ Two hard consequences:
 1. **SA-MP deliberately caps itself at 1 GB** because the process is 32-bit.
    Going above ~1 GB in SA-MP is documented to *break* streaming: past ~1 GB
    used, textures stop loading or load extremely slowly, and players work
-   around it by reconnecting every 10–15 minutes (SA-MP forum tid=595677).
-   So in SA-MP a 2000 MB pool is not merely wasteful — it is **actively
-   harmful**. The safe cap under SA-MP is **~1024 MB**, matching what SA-MP
-   itself picks on a healthy machine.
+   around it by restarting/reconnecting every ~10 minutes (SA-MP forum
+   tid=595677, users Endamete/enbman; the thread's own fix is the
+   LARGE_ADDRESS_AWARE patch). So in SA-MP a 2000 MB pool is not merely
+   wasteful — it is **actively harmful**. The safe cap under SA-MP is
+   **~1024 MB**, matching what SA-MP itself picks on a healthy machine.
+
+   *Sourcing:* the tier table and the ~1 GB failure are community-sourced
+   (SA-MP forum, cross-checked against the primary thread) — not official
+   SA-MP documentation and not yet confirmed by a runtime read on this
+   target. Reading `0x8A5A80` in-game (step below) is the authoritative
+   check and should be done before the auto-clamp acts on these numbers.
 2. **`StreamMemoryForced` is re-asserted every tick**, so it overrides SA-MP's
    tier value. That is the exact mechanism that would push the pool past
    SA-MP's safe 1 GB and trigger the failure above. The mod must read and log
